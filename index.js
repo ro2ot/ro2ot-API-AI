@@ -299,6 +299,9 @@ app.post('/webhook', async (req, res) => {
         }
 
         await sendChatAction(chatId, 'typing');
+        
+        // تاخیر ۱.۵ ثانیه‌ای برای جلوگیری از Rate Limit
+        await new Promise(resolve => setTimeout(resolve, 1500));
 
         try {
             const session = user.sessions[user.currentSessionIndex];
@@ -348,10 +351,18 @@ app.post('/webhook', async (req, res) => {
         } catch (error) {
             console.error('❌ Error processing message:', error);
             let errorMessage = error.message || 'خطای ناشناخته';
-            if (errorMessage.includes('عکس') || errorMessage.includes('photo')) {
+            
+            // نمایش خطای ۴۲۹ به کاربر
+            if (error.message && error.message.includes('429')) {
+                errorMessage = '⚠️ **محدودیت درخواست Gemini پر شده است.**\nلطفاً چند دقیقه صبر کنید و دوباره تلاش کنید.';
+            } else if (error.message && error.message.includes('عکس')) {
                 errorMessage = '⚠️ **خطا در پردازش عکس.** لطفاً عکس را مجدداً ارسال کنید یا از عکس دیگری استفاده کنید.';
-            } else if (errorMessage.includes('Gemini')) {
-                errorMessage = `⚠️ **خطا از سرویس Gemini:**\n${errorMessage}`;
+            } else if (error.message && error.message.includes('Gemini Error (401)')) {
+                errorMessage = '⚠️ **خطا در احراز هویت Gemini.** لطفاً کلید API را بررسی کنید.';
+            } else if (error.message && error.message.includes('Gemini Error (503)')) {
+                errorMessage = '⚠️ **سرور Gemini شلوغ است.** لطفاً چند دقیقه دیگر تلاش کنید.';
+            } else if (error.message && error.message.includes('Gemini')) {
+                errorMessage = `⚠️ **خطا از سرویس Gemini:**\n${error.message}`;
             } else {
                 errorMessage = `❌ **خطا:** ${errorMessage}`;
             }
