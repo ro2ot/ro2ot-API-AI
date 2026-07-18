@@ -14,9 +14,6 @@ const __dirname = path.dirname(__filename);
 const app = express();
 app.use(express.json());
 
-// ============================
-// Database
-// ============================
 let db;
 async function initDb() {
     db = await open({
@@ -36,26 +33,18 @@ async function initDb() {
 }
 await initDb();
 
-// ============================
-// Tokens & Clients
-// ============================
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GAPGPT_API_KEY = process.env.OPENAI_API_KEY;
 
-// Gemini
 const MODEL_NAME = 'gemini-3.5-flash';
 const GEMINI_API_URL = `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent?key=${GEMINI_API_KEY}`;
 
-// GapGPT (OpenAI compatible)
 const gapgptClient = new OpenAI({
     apiKey: GAPGPT_API_KEY,
     baseURL: 'https://api.gapgpt.app/v1'
 });
 
-// ============================
-// Helper Functions
-// ============================
 async function sendMessage(chatId, text, replyMarkup = null) {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
     const payload = { chat_id: chatId, text, parse_mode: 'Markdown' };
@@ -68,10 +57,9 @@ async function sendMessage(chatId, text, replyMarkup = null) {
     return res.json();
 }
 
-async function editMessage(chatId, messageId, text, replyMarkup = null) {
+async function editMessage(chatId, messageId, text) {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`;
-    const payload = { chat_id: chatId, message_id: messageId, text, parse_mode: 'Markdown' };
-    if (replyMarkup) payload.reply_markup = replyMarkup;
+    const payload = { chat_id: chatId, message_id: messageId, text };
     const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -90,20 +78,8 @@ async function sendChatAction(chatId, action = 'typing') {
     return res.json();
 }
 
-// --- New: Send or Update a Draft Message ---
-async function sendMessageDraft(chatId, draftId, text) {
-    const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessageDraft`;
-    const payload = {
-        chat_id: chatId,
-        draft_id: draftId,
-        text: text
-    };
-    const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-    });
-    return res.json();
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function splitLongMessage(text, maxLength = 4096) {
@@ -122,13 +98,6 @@ function splitLongMessage(text, maxLength = 4096) {
     return parts;
 }
 
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-// ============================
-// User Functions
-// ============================
 async function getUser(chatId) {
     let user = await db.get('SELECT * FROM users WHERE chatId = ?', chatId);
     if (!user) {
@@ -155,10 +124,9 @@ async function saveUser(chatId, data) {
 }
 
 // ============================
-// AI Functions
+// AI Functions (Streaming)
 // ============================
 
-// Gemini - with streaming support (yields chunks)
 async function* askGeminiStream(history, photoBase64 = null) {
     const contents = history.map(msg => ({
         role: msg.role === 'user' ? 'user' : 'model',
@@ -175,7 +143,6 @@ async function* askGeminiStream(history, photoBase64 = null) {
         });
     }
 
-    // Gemini doesn't natively stream, so we get the full response and then yield it in chunks
     const response = await fetch(GEMINI_API_URL, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -190,17 +157,15 @@ async function* askGeminiStream(history, photoBase64 = null) {
     const fullReply = data.candidates?.[0]?.content?.parts?.[0]?.text;
     if (!fullReply) throw new Error('پاسخی از Gemini دریافت نشد.');
 
-    // Yield the full reply in small chunks (e.g., word by word)
     const words = fullReply.split(' ');
     let accumulated = '';
     for (const word of words) {
         accumulated += word + ' ';
         yield accumulated.trim();
-        await sleep(80); // Simulate typing speed
+        await sleep(80);
     }
 }
 
-// GapGPT (DeepSeek) - supports native streaming
 async function* askGapGPTStream(history, photoBase64 = null) {
     const messages = history.map(msg => ({
         role: msg.role === 'user' ? 'user' : 'assistant',
@@ -230,7 +195,7 @@ async function* askGapGPTStream(history, photoBase64 = null) {
 }
 
 // ============================
-// Fallback with Streaming Support
+// Fallback with Streaming
 // ============================
 async function* askWithFallbackStream(chatId, history, userAI, photoBase64 = null) {
     const maxRetries = 2;
@@ -253,18 +218,16 @@ async function* askWithFallbackStream(chatId, history, userAI, photoBase64 = nul
                 } else {
                     yield* askGapGPTStream(history, photoBase64);
                 }
-                return; // Success, exit the generator
+                return;
             } catch (error) {
                 lastError = error;
                 console.warn(`❌ ${model} (تلاش ${attempt}/${maxRetries}) خطا:`, error.message);
-                
                 if (error.message.includes('429') || error.message.includes('503')) {
                     const waitTime = Math.min(1000 * Math.pow(2, attempt), 10000);
-                    console.log(`⏳ صبر ${waitTime/1000} ثانیه و تلاش مجدد...`);
                     await sleep(waitTime);
                     continue;
                 } else {
-                    break; // Non-retryable error, try next model
+                    break;
                 }
             }
         }
@@ -318,13 +281,12 @@ function backToMenuButton() {
 }
 
 // ============================
-// Main Webhook
+// Webhook
 // ============================
 app.post('/webhook', async (req, res) => {
     const body = req.body;
     if (!body) return res.sendStatus(200);
 
-    // --- Callback Query ---
     if (body.callback_query) {
         const query = body.callback_query;
         const chatId = query.message.chat.id;
@@ -436,7 +398,6 @@ app.post('/webhook', async (req, res) => {
         return res.sendStatus(200);
     }
 
-    // --- Text Messages ---
     if (body.message) {
         const message = body.message;
         const chatId = message.chat.id;
@@ -447,7 +408,6 @@ app.post('/webhook', async (req, res) => {
         let user = await getUser(chatId);
         const userText = text || caption || '';
 
-        // --- Waiting for user input (rename) ---
         if (user.waitingFor === 'rename') {
             if (!userText) {
                 await sendMessage(chatId, '❌ **لطفاً یک نام معتبر وارد کنید.**');
@@ -461,7 +421,6 @@ app.post('/webhook', async (req, res) => {
             return res.sendStatus(200);
         }
 
-        // --- Commands ---
         if (userText === '/start') {
             const welcome = 
                 '🌟 **به Gemrox خوش آمدید!** 🌟\n\n' +
@@ -490,21 +449,18 @@ app.post('/webhook', async (req, res) => {
             return res.sendStatus(200);
         }
 
-        // --- Normal Message Processing with Streaming ---
         await sendChatAction(chatId, 'typing');
 
         try {
             const session = user.sessions[user.currentSessionIndex];
             const history = session.history || [];
 
-            // Add user message to history
             const userMsg = {
                 role: 'user',
                 parts: [{ text: userText || 'لطفاً این عکس را تحلیل کن.' }]
             };
             history.push(userMsg);
 
-            // Handle photo (only for Gemini)
             let photoBase64 = null;
             if (photo) {
                 const fileId = photo[photo.length - 1].file_id;
@@ -523,35 +479,34 @@ app.post('/webhook', async (req, res) => {
                 photoBase64 = Buffer.from(buffer).toString('base64');
             }
 
-            // Generate a unique draft ID for this streaming session
-            const draftId = Date.now();
+            // ارسال پیام اولیه
+            const initialMsg = await sendMessage(chatId, '⏳ در حال تایپ...');
+            const draftMessageId = initialMsg.result.message_id;
 
-            // Stream the response
             let fullReply = '';
             const streamGenerator = askWithFallbackStream(chatId, history, user.currentAI, photoBase64);
-            
+
+            let chunkCount = 0;
             for await (const chunk of streamGenerator) {
                 fullReply = chunk;
-                // Update the draft with the current accumulated text
-                await sendMessageDraft(chatId, draftId, chunk);
+                chunkCount++;
+                // فقط هر ۳ تکه یکبار ویرایش کن تا از Rate Limit تلگرام عبور نکنی
+                if (chunkCount % 3 === 0) {
+                    await editMessage(chatId, draftMessageId, chunk + ' ✍️');
+                    await sleep(300);
+                }
             }
 
-            // Finalize: send the complete message using sendMessage
-            // First, delete the draft (it auto-expires, but better to clean up)
-            // Then send the final message
-            const parts = splitLongMessage(fullReply);
-            for (const part of parts) {
-                await sendMessage(chatId, part);
-            }
+            // ویرایش نهایی (بدون ✍️)
+            await editMessage(chatId, draftMessageId, fullReply);
 
-            // Add AI response to history
+            // اضافه کردن به تاریخچه
             const modelMsg = {
                 role: 'model',
                 parts: [{ text: fullReply }]
             };
             history.push(modelMsg);
 
-            // Keep only last 10 messages
             if (history.length > 10) {
                 session.history = history.slice(-10);
             } else {
@@ -584,9 +539,6 @@ app.post('/webhook', async (req, res) => {
     res.sendStatus(200);
 });
 
-// ============================
-// Set Persistent Menu Commands
-// ============================
 async function setCommands() {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands`;
     const commands = [
