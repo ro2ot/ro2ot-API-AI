@@ -136,7 +136,6 @@ async function transcribeAudio(audioUrl) {
             throw new Error('خطا در دانلود فایل صوتی');
         }
         
-        // استفاده از arrayBuffer و تبدیل به Buffer
         const arrayBuffer = await audioResponse.arrayBuffer();
         const audioBuffer = Buffer.from(arrayBuffer);
 
@@ -149,7 +148,8 @@ async function transcribeAudio(audioUrl) {
         const response = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
             method: 'POST',
             headers: {
-                'Authorization': `Bearer ${GROQ_API_KEY}`
+                'Authorization': `Bearer ${GROQ_API_KEY}`,
+                ...formData.getHeaders() // تنظیم خودکار Content-Type
             },
             body: formData
         });
