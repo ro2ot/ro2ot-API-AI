@@ -159,19 +159,20 @@ async function* askGeminiStream(history, photoBase64 = null) {
     for (const word of words) {
         accumulated += word + ' ';
         yield accumulated.trim();
-        await sleep(30); // ⬅️ سرعت ۳ برابر بیشتر
+        await sleep(30);
     }
 }
 
 async function* askGapGPTStream(history, photoBase64 = null) {
+    // اگر عکس وجود داشته باشه، کاربر رو مطلع کن که این مدل عکس نمی‌بینه
+    if (photoBase64) {
+        throw new Error('این مدل قابلیت تحلیل عکس را ندارد. لطفاً از Gemini استفاده کنید.');
+    }
+
     const messages = history.map(msg => ({
         role: msg.role === 'user' ? 'user' : 'assistant',
         content: msg.parts[0]?.text || ''
     }));
-
-    if (photoBase64 && messages.length > 0) {
-        messages[messages.length - 1].content += '\n[عکس ارسال شده]';
-    }
 
     const stream = await gapgptClient.chat.completions.create({
         model: 'gpt-4o-mini',
@@ -195,6 +196,28 @@ async function* askWithFallbackStream(chatId, history, userAI, photoBase64 = nul
     const maxRetries = 2;
     let lastError = null;
     
+    // اگر عکس وجود داره، فقط Gemini رو امتحان کن (Fallback نرو)
+    if (photoBase64) {
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                yield* askGeminiStream(history, photoBase64);
+                return;
+            } catch (error) {
+                lastError = error;
+                console.warn(`❌ Gemini (تلاش ${attempt}/${maxRetries}) خطا:`, error.message);
+                if (error.message.includes('429') || error.message.includes('503')) {
+                    const waitTime = Math.min(1000 * Math.pow(2, attempt), 10000);
+                    await sleep(waitTime);
+                    continue;
+                } else {
+                    throw new Error(`تحلیل عکس با Gemini ممکن نیست: ${error.message}`);
+                }
+            }
+        }
+        throw new Error(`تحلیل عکس با Gemini ممکن نیست. لطفاً چند دقیقه دیگر تلاش کنید.`);
+    }
+
+    // اگر عکس وجود نداشت، Fallback عادی بین مدل‌ها
     const models = [];
     if (userAI === 'gemini') {
         models.push('gemini');
@@ -208,9 +231,9 @@ async function* askWithFallbackStream(chatId, history, userAI, photoBase64 = nul
         for (let attempt = 1; attempt <= maxRetries; attempt++) {
             try {
                 if (model === 'gemini') {
-                    yield* askGeminiStream(history, photoBase64);
+                    yield* askGeminiStream(history, null);
                 } else {
-                    yield* askGapGPTStream(history, photoBase64);
+                    yield* askGapGPTStream(history, null);
                 }
                 return;
             } catch (error) {
@@ -230,8 +253,11 @@ async function* askWithFallbackStream(chatId, history, userAI, photoBase64 = nul
     throw new Error(`همه مدل‌ها خطا دادند: ${lastError?.message || 'Unknown'}`);
 }
 
+// ============================
+// منوها - تغییر نام DeepSeek به Weak Model
+// ============================
 function mainMenu(currentAI) {
-    const aiLabel = currentAI === 'gemini' ? '🤖 Gemini' : '🐋 DeepSeek';
+    const aiLabel = currentAI === 'gemini' ? '🤖 Gemini' : '⚡ Weak Model';
     return {
         inline_keyboard: [
             [{ text: `🤖 هوش فعلی: ${aiLabel}`, callback_data: 'switch_ai' }],
@@ -248,7 +274,7 @@ function aiSelectionMenu() {
     return {
         inline_keyboard: [
             [{ text: '🤖 Gemini', callback_data: 'set_ai_gemini' }],
-            [{ text: '🐋 DeepSeek', callback_data: 'set_ai_gapgpt' }],
+            [{ text: '⚡ Weak Model', callback_data: 'set_ai_gapgpt' }],
             [{ text: '🔙 برگشت به منو', callback_data: 'back_main' }]
         ]
     };
@@ -303,7 +329,7 @@ app.post('/webhook', async (req, res) => {
             if (data === 'set_ai_gapgpt') {
                 user.currentAI = 'gapgpt';
                 await saveUser(chatId, user);
-                await editMessage(chatId, messageId, '✅ **هوش مصنوعی به DeepSeek تغییر یافت.**', mainMenu('gapgpt'));
+                await editMessage(chatId, messageId, '✅ **هوش مصنوعی به Weak Model تغییر یافت.**', mainMenu('gapgpt'));
                 return res.sendStatus(200);
             }
 
@@ -414,7 +440,7 @@ app.post('/webhook', async (req, res) => {
                 '🌟 **به Gemrox خوش آمدید!** 🌟\n\n' +
                 'من یک دستیار هوشمند با دو موتور قدرتمند هستم:\n' +
                 '🤖 **Gemini** – تحلیل عکس و پاسخ‌های دقیق\n' +
-                '🐋 **DeepSeek** – پاسخ‌های سریع و اقتصادی\n\n' +
+                '⚡ **Weak Model** – پاسخ‌های سریع و اقتصادی (بدون تحلیل عکس)\n\n' +
                 '📌 **دستورات سریع:**\n' +
                 '/menu - نمایش منوی اصلی\n\n' +
                 '🔽 برای شروع، دکمه‌ی منو را بزنید:';
@@ -467,7 +493,6 @@ app.post('/webhook', async (req, res) => {
                 photoBase64 = Buffer.from(buffer).toString('base64');
             }
 
-            // شروع Stream بدون پیام اولیه
             let firstChunk = true;
             let draftMessageId = null;
             let fullReply = '';
@@ -479,18 +504,15 @@ app.post('/webhook', async (req, res) => {
                 chunkCount++;
                 
                 if (firstChunk) {
-                    // ارسال اولین تکه به عنوان پیام اولیه
                     const initialMsg = await sendMessage(chatId, chunk + ' ✍️');
                     draftMessageId = initialMsg.result.message_id;
                     firstChunk = false;
                 } else if (chunkCount % 2 === 0) {
-                    // هر ۲ تکه یکبار ویرایش کن
                     await editMessage(chatId, draftMessageId, chunk + ' ✍️');
                     await sleep(100);
                 }
             }
 
-            // ویرایش نهایی (بدون ✍️)
             await editMessage(chatId, draftMessageId, fullReply);
 
             const modelMsg = {
@@ -519,6 +541,8 @@ app.post('/webhook', async (req, res) => {
                 errorMessage = '⚠️ **خطا در احراز هویت.** لطفاً کلید API را بررسی کنید.';
             } else if (error.message && error.message.includes('عکس')) {
                 errorMessage = '⚠️ **خطا در پردازش عکس.** لطفاً عکس را مجدداً ارسال کنید.';
+            } else if (error.message && error.message.includes('تحلیل عکس')) {
+                errorMessage = `⚠️ ${error.message}`;
             } else {
                 errorMessage = `❌ **خطا:** ${errorMessage}`;
             }
@@ -551,5 +575,5 @@ setCommands().catch(console.error);
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🤖 Gemrox bot running on port ${PORT}`);
-    console.log(`📡 Models: Gemini (${MODEL_NAME}) + DeepSeek (گپ‌جی‌پی‌تی)`);
+    console.log(`📡 Models: Gemini + Weak Model (گپ‌جی‌پی‌تی)`);
 });
