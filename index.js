@@ -24,7 +24,8 @@ async function initDb() {
             currentSessionIndex INTEGER DEFAULT 0,
             waitingFor TEXT,
             currentAI TEXT DEFAULT 'gemini',
-            memory TEXT DEFAULT '[]'
+            memory TEXT DEFAULT '[]',
+            pendingMessage TEXT
         )
     `);
     console.log('✅ Database ready');
@@ -105,9 +106,9 @@ async function getUser(chatId) {
             name: 'مکالمه اصلی',
             history: []
         }]);
-        await db.run('INSERT INTO users (chatId, sessions, currentSessionIndex, waitingFor, currentAI, memory) VALUES (?, ?, ?, ?, ?, ?)', 
-            chatId, defaultSessions, 0, null, 'gemini', '[]');
-        user = { chatId, sessions: defaultSessions, currentSessionIndex: 0, waitingFor: null, currentAI: 'gemini', memory: '[]' };
+        await db.run('INSERT INTO users (chatId, sessions, currentSessionIndex, waitingFor, currentAI, memory, pendingMessage) VALUES (?, ?, ?, ?, ?, ?, ?)', 
+            chatId, defaultSessions, 0, null, 'gemini', '[]', null);
+        user = { chatId, sessions: defaultSessions, currentSessionIndex: 0, waitingFor: null, currentAI: 'gemini', memory: '[]', pendingMessage: null };
     }
     user.sessions = JSON.parse(user.sessions);
     user.memory = JSON.parse(user.memory);
@@ -119,8 +120,8 @@ async function getUser(chatId) {
 }
 
 async function saveUser(chatId, data) {
-    await db.run('UPDATE users SET sessions = ?, currentSessionIndex = ?, waitingFor = ?, currentAI = ?, memory = ? WHERE chatId = ?',
-        JSON.stringify(data.sessions), data.currentSessionIndex, data.waitingFor || null, data.currentAI, JSON.stringify(data.memory), chatId);
+    await db.run('UPDATE users SET sessions = ?, currentSessionIndex = ?, waitingFor = ?, currentAI = ?, memory = ?, pendingMessage = ? WHERE chatId = ?',
+        JSON.stringify(data.sessions), data.currentSessionIndex, data.waitingFor || null, data.currentAI, JSON.stringify(data.memory), data.pendingMessage || null, chatId);
 }
 
 async function* askGeminiStream(history, systemInstruction, photoBase64 = null) {
@@ -197,67 +198,50 @@ async function* askGapGPTStream(history, photoBase64 = null) {
     if (!accumulated) throw new Error('پاسخی از گپ‌جی‌پی‌تی دریافت نشد.');
 }
 
-async function* askWithFallbackStream(chatId, history, userAI, photoBase64 = null) {
-    const maxRetries = 2;
-    let lastError = null;
-    const user = await getUser(chatId);
+// ============================
+// تابع پردازش پیام (با مدیریت خطا و پیشنهاد سوئیچ)
+// ============================
+async function processMessageWithAI(chatId, user, history, userText, photoBase64 = null) {
     const systemInstruction = user.memory.join('\n');
     
-    if (photoBase64) {
-        for (let attempt = 1; attempt <= maxRetries; attempt++) {
-            try {
-                yield* askGeminiStream(history, systemInstruction, photoBase64);
-                return;
-            } catch (error) {
-                lastError = error;
-                console.warn(`❌ Gemini (تلاش ${attempt}/${maxRetries}) خطا:`, error.message);
-                if (error.message.includes('429') || error.message.includes('503')) {
-                    const waitTime = Math.min(1000 * Math.pow(2, attempt), 10000);
-                    await sleep(waitTime);
-                    continue;
-                } else {
-                    throw new Error(`تحلیل عکس با Gemini ممکن نیست: ${error.message}`);
-                }
-            }
-        }
-        throw new Error(`تحلیل عکس با Gemini ممکن نیست. لطفاً چند دقیقه دیگر تلاش کنید.`);
+    // اگر مدل فعلی Weak Model هست، مستقیم برو
+    if (user.currentAI === 'gapgpt') {
+        const streamGenerator = askGapGPTStream(history, photoBase64);
+        return streamGenerator;
     }
 
-    const models = [];
-    if (userAI === 'gemini') {
-        models.push('gemini');
-        models.push('gapgpt');
-    } else {
-        models.push('gapgpt');
-        models.push('gemini');
-    }
-
-    for (const model of models) {
-        for (let attempt = 1; attempt <= maxRetries; attempt++) {
-            try {
-                if (model === 'gemini') {
-                    yield* askGeminiStream(history, systemInstruction, null);
-                } else {
-                    yield* askGapGPTStream(history, null);
-                }
-                return;
-            } catch (error) {
-                lastError = error;
-                console.warn(`❌ ${model} (تلاش ${attempt}/${maxRetries}) خطا:`, error.message);
-                if (error.message.includes('429') || error.message.includes('503')) {
-                    const waitTime = Math.min(1000 * Math.pow(2, attempt), 10000);
-                    await sleep(waitTime);
-                    continue;
-                } else {
-                    break;
-                }
-            }
+    // اگر مدل فعلی Gemini هست، امتحان کن
+    try {
+        const streamGenerator = askGeminiStream(history, systemInstruction, photoBase64);
+        // یکبار تکرار کن تا ببینیم خطا میده یا نه
+        const first = await streamGenerator.next();
+        if (first.done) {
+            throw new Error('پاسخی از Gemini دریافت نشد.');
         }
+        // اگر رسیدیم اینجا، یعنی کار میکنه
+        // یه generator جدید برمیگردونیم که از اول شروع کنه
+        return (async function*() {
+            yield first.value;
+            for await (const chunk of streamGenerator) {
+                yield chunk;
+            }
+        })();
+    } catch (error) {
+        // اگر خطای ۴۲۹ یا ۵۰۳ بود، پیشنهاد سوئیچ به Weak Model بده
+        if (error.message && (error.message.includes('429') || error.message.includes('503'))) {
+            // ذخیره پیام معلق برای پردازش بعدی
+            user.pendingMessage = userText || 'عکس';
+            await saveUser(chatId, user);
+            throw new Error('SWITCH_TO_WEAK');
+        }
+        // خطای دیگه رو پرتاب کن
+        throw error;
     }
-    
-    throw new Error(`همه مدل‌ها خطا دادند: ${lastError?.message || 'Unknown'}`);
 }
 
+// ============================
+// خلاصه‌سازی لینک (با Fallback به Weak Model)
+// ============================
 async function summarizeLink(url) {
     try {
         const response = await fetch(url, {
@@ -281,24 +265,42 @@ async function summarizeLink(url) {
         }
 
         const summaryPrompt = `لطفاً متن زیر را به‌صورت مختصر و مفید خلاصه کن. خلاصه باید شامل مهم‌ترین نکات باشد:\n\n${text}`;
-        const history = [{ role: 'user', parts: [{ text: summaryPrompt }] }];
-        const contents = history.map(msg => ({
-            role: msg.role === 'user' ? 'user' : 'model',
-            parts: msg.parts
-        }));
-        const payload = { contents };
-        const geminiRes = await fetch(GEMINI_API_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-        });
-        const data = await geminiRes.json();
-        if (!geminiRes.ok) {
-            let errMsg = data.error?.message || 'Unknown error';
-            throw new Error(`Gemini Error: ${errMsg}`);
+
+        // امتحان با Gemini اول
+        let summary = null;
+        try {
+            const history = [{ role: 'user', parts: [{ text: summaryPrompt }] }];
+            const contents = history.map(msg => ({
+                role: msg.role === 'user' ? 'user' : 'model',
+                parts: msg.parts
+            }));
+            const payload = { contents };
+            const geminiRes = await fetch(GEMINI_API_URL, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+            const data = await geminiRes.json();
+            if (geminiRes.ok) {
+                summary = data.candidates?.[0]?.content?.parts?.[0]?.text;
+                if (summary) return summary;
+            }
+        } catch (error) {
+            console.warn('⚠️ Gemini Error, falling back to Weak Model:', error.message);
         }
-        const summary = data.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (!summary) throw new Error('خلاصه‌سازی انجام نشد.');
+
+        // Fallback به Weak Model
+        const messages = [
+            { role: 'system', content: 'تو یک دستیار خلاصه‌ساز هستی.' },
+            { role: 'user', content: summaryPrompt }
+        ];
+        const weakRes = await gapgptClient.chat.completions.create({
+            model: 'gpt-4o-mini',
+            messages: messages,
+            stream: false,
+        });
+        summary = weakRes.choices?.[0]?.message?.content;
+        if (!summary) throw new Error('خلاصه‌سازی با Weak Model انجام نشد.');
         return summary;
     } catch (error) {
         console.error('❌ خطا در خلاصه‌سازی لینک:', error);
@@ -369,6 +371,15 @@ function backToMenuButton() {
     return {
         inline_keyboard: [
             [{ text: '🔙 برگشت به منو', callback_data: 'back_main' }]
+        ]
+    };
+}
+
+function switchToWeakMenu(pendingMessage) {
+    return {
+        inline_keyboard: [
+            [{ text: '✅ بله، سوئیچ کن', callback_data: 'confirm_switch_to_weak' }],
+            [{ text: '❌ نه، فقط خطا رو نشون بده', callback_data: 'cancel_switch_to_weak' }]
         ]
     };
 }
@@ -542,6 +553,38 @@ app.post('/webhook', async (req, res) => {
                 return res.sendStatus(200);
             }
 
+            // ====== مدیریت سوئیچ به Weak Model ======
+            if (data === 'confirm_switch_to_weak') {
+                // تغییر مدل به Weak Model
+                user.currentAI = 'gapgpt';
+                const pendingMsg = user.pendingMessage;
+                user.pendingMessage = null;
+                await saveUser(chatId, user);
+
+                await editMessage(chatId, messageId, '✅ **سوئیچ به Weak Model انجام شد.**\nدر حال پردازش مجدد پیام...');
+
+                // پردازش مجدد پیام با Weak Model
+                const session = user.sessions[user.currentSessionIndex];
+                // حذف آخرین پیام کاربر از تاریخچه (چون با خطا مواجه شده بود)
+                if (session.history.length > 0 && session.history[session.history.length - 1].role === 'user') {
+                    session.history.pop();
+                }
+                await saveUser(chatId, user);
+
+                // ارسال پیام جدید برای پردازش (با تاخیر)
+                setTimeout(async () => {
+                    await processNormalMessage(chatId, pendingMsg, null);
+                }, 1000);
+                return res.sendStatus(200);
+            }
+
+            if (data === 'cancel_switch_to_weak') {
+                user.pendingMessage = null;
+                await saveUser(chatId, user);
+                await editMessage(chatId, messageId, '❌ **سوئیچ انجام نشد.**\n\nمی‌توانید بعداً از منوی «انتخاب مدل» به Weak Model سوئیچ کنید.', backToMenuButton());
+                return res.sendStatus(200);
+            }
+
         } catch (error) {
             console.error('❌ Error in callback:', error);
             await sendMessage(chatId, '❌ خطایی رخ داد. لطفاً دوباره تلاش کنید.');
@@ -641,98 +684,131 @@ app.post('/webhook', async (req, res) => {
             return res.sendStatus(200);
         }
 
-        // --- Normal message processing (Chat) ---
-        await sendChatAction(chatId, 'typing');
-
-        try {
-            const session = user.sessions[user.currentSessionIndex];
-            const history = session.history || [];
-
-            const userMsg = {
-                role: 'user',
-                parts: [{ text: userText || 'لطفاً این عکس را تحلیل کن.' }]
-            };
-            history.push(userMsg);
-
-            let photoBase64 = null;
-            if (photo) {
-                const fileId = photo[photo.length - 1].file_id;
-                const fileInfo = await fetch(
-                    `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`
-                ).then(r => r.json());
-                if (!fileInfo.ok) {
-                    throw new Error(`خطا در دریافت اطلاعات عکس: ${fileInfo.description || 'Unknown'}`);
-                }
-                const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.result.file_path}`;
-                const imgRes = await fetch(fileUrl);
-                if (!imgRes.ok) {
-                    throw new Error(`خطا در دانلود عکس: ${imgRes.status}`);
-                }
-                const buffer = await imgRes.arrayBuffer();
-                photoBase64 = Buffer.from(buffer).toString('base64');
-            }
-
-            let firstChunk = true;
-            let draftMessageId = null;
-            let fullReply = '';
-            const streamGenerator = askWithFallbackStream(chatId, history, user.currentAI, photoBase64);
-
-            let chunkCount = 0;
-            for await (const chunk of streamGenerator) {
-                fullReply = chunk;
-                chunkCount++;
-                
-                if (firstChunk) {
-                    const initialMsg = await sendMessage(chatId, chunk + ' ✍️');
-                    draftMessageId = initialMsg.result.message_id;
-                    firstChunk = false;
-                } else if (chunkCount % 2 === 0) {
-                    await editMessage(chatId, draftMessageId, chunk + ' ✍️');
-                    await sleep(100);
-                }
-            }
-
-            await editMessage(chatId, draftMessageId, fullReply);
-
-            const modelMsg = {
-                role: 'model',
-                parts: [{ text: fullReply }]
-            };
-            history.push(modelMsg);
-
-            if (history.length > 10) {
-                session.history = history.slice(-10);
-            } else {
-                session.history = history;
-            }
-
-            await saveUser(chatId, user);
-
-        } catch (error) {
-            console.error('❌ Error processing message:', error);
-            let errorMessage = error.message || 'خطای ناشناخته';
-            
-            if (error.message && error.message.includes('429')) {
-                errorMessage = '⚠️ **محدودیت درخواست پر شده است.** لطفاً چند دقیقه صبر کنید و دوباره تلاش کنید.';
-            } else if (error.message && error.message.includes('503')) {
-                errorMessage = '⚠️ **سرور شلوغ است.** لطفاً چند دقیقه دیگر تلاش کنید.';
-            } else if (error.message && error.message.includes('401')) {
-                errorMessage = '⚠️ **خطا در احراز هویت.** لطفاً کلید API را بررسی کنید.';
-            } else if (error.message && error.message.includes('عکس')) {
-                errorMessage = '⚠️ **خطا در پردازش عکس.** لطفاً عکس را مجدداً ارسال کنید.';
-            } else if (error.message && error.message.includes('تحلیل عکس')) {
-                errorMessage = `⚠️ ${error.message}`;
-            } else {
-                errorMessage = `❌ **خطا:** ${errorMessage}`;
-            }
-            await sendMessage(chatId, errorMessage);
-        }
+        // ====== پردازش پیام معمولی ======
+        await processNormalMessage(chatId, userText, photo);
 
         return res.sendStatus(200);
     }
 
     res.sendStatus(200);
 });
+
+// ============================
+// تابع پردازش پیام (جدا شده برای استفاده مجدد)
+// ============================
+async function processNormalMessage(chatId, userText, photo) {
+    let user = await getUser(chatId);
+    const session = user.sessions[user.currentSessionIndex];
+    const history = session.history || [];
+
+    // اضافه کردن پیام کاربر به تاریخچه
+    const userMsg = {
+        role: 'user',
+        parts: [{ text: userText || 'لطفاً این عکس را تحلیل کن.' }]
+    };
+    history.push(userMsg);
+    await saveUser(chatId, user);
+
+    // پردازش عکس
+    let photoBase64 = null;
+    if (photo) {
+        try {
+            const fileId = photo[photo.length - 1].file_id;
+            const fileInfo = await fetch(
+                `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`
+            ).then(r => r.json());
+            if (!fileInfo.ok) {
+                throw new Error(`خطا در دریافت اطلاعات عکس: ${fileInfo.description || 'Unknown'}`);
+            }
+            const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.result.file_path}`;
+            const imgRes = await fetch(fileUrl);
+            if (!imgRes.ok) {
+                throw new Error(`خطا در دانلود عکس: ${imgRes.status}`);
+            }
+            const buffer = await imgRes.arrayBuffer();
+            photoBase64 = Buffer.from(buffer).toString('base64');
+        } catch (error) {
+            console.error('❌ خطا در پردازش عکس:', error);
+            await sendMessage(chatId, `⚠️ **خطا در پردازش عکس:** ${error.message}`);
+            return;
+        }
+    }
+
+    try {
+        // استفاده از تابع processMessageWithAI
+        const streamGenerator = await processMessageWithAI(chatId, user, history, userText, photoBase64);
+
+        let firstChunk = true;
+        let draftMessageId = null;
+        let fullReply = '';
+        let chunkCount = 0;
+
+        for await (const chunk of streamGenerator) {
+            fullReply = chunk;
+            chunkCount++;
+            
+            if (firstChunk) {
+                const initialMsg = await sendMessage(chatId, chunk + ' ✍️');
+                draftMessageId = initialMsg.result.message_id;
+                firstChunk = false;
+            } else if (chunkCount % 2 === 0) {
+                await editMessage(chatId, draftMessageId, chunk + ' ✍️');
+                await sleep(100);
+            }
+        }
+
+        if (draftMessageId) {
+            await editMessage(chatId, draftMessageId, fullReply);
+        } else {
+            // اگر هیچ chunkی نرسید، احتمالاً خطایی رخ داده
+            throw new Error('پاسخی دریافت نشد.');
+        }
+
+        // اضافه کردن پاسخ به تاریخچه
+        const modelMsg = {
+            role: 'model',
+            parts: [{ text: fullReply }]
+        };
+        history.push(modelMsg);
+
+        if (history.length > 10) {
+            session.history = history.slice(-10);
+        } else {
+            session.history = history;
+        }
+
+        await saveUser(chatId, user);
+
+    } catch (error) {
+        console.error('❌ Error processing message:', error);
+        
+        // اگر خطای SWITCH_TO_WEAK بود، پیشنهاد سوئیچ بده
+        if (error.message === 'SWITCH_TO_WEAK') {
+            await sendMessage(chatId, 
+                '⚠️ **Gemini به محدودیت درخواست (Rate Limit) خورده است.**\n\n' +
+                'می‌خواهید به **Weak Model** سوئیچ کنید و مکالمه را ادامه دهید؟\n\n' +
+                '🔹 Weak Model سریع‌تر است ولی قابلیت تحلیل عکس را ندارد.',
+                switchToWeakMenu(userText)
+            );
+            return;
+        }
+
+        // خطاهای دیگه
+        let errorMessage = error.message || 'خطای ناشناخته';
+        if (error.message && error.message.includes('429')) {
+            errorMessage = '⚠️ **محدودیت درخواست Gemini پر شده است.** لطفاً چند دقیقه صبر کنید یا از منو به Weak Model سوئیچ کنید.';
+        } else if (error.message && error.message.includes('503')) {
+            errorMessage = '⚠️ **سرور Gemini شلوغ است.** لطفاً چند دقیقه دیگر تلاش کنید یا از منو به Weak Model سوئیچ کنید.';
+        } else if (error.message && error.message.includes('401')) {
+            errorMessage = '⚠️ **خطا در احراز هویت.** لطفاً کلید API را بررسی کنید.';
+        } else if (error.message && error.message.includes('عکس')) {
+            errorMessage = `⚠️ **خطا در پردازش عکس.** ${error.message}`;
+        } else {
+            errorMessage = `❌ **خطا:** ${errorMessage}`;
+        }
+        await sendMessage(chatId, errorMessage);
+    }
+}
 
 async function setCommands() {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands`;
