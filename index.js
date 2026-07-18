@@ -45,9 +45,6 @@ const gapgptClient = new OpenAI({
     baseURL: 'https://api.gapgpt.app/v1'
 });
 
-// ============================
-// توابع ارسال و ویرایش (با پشتیبانی از replyMarkup)
-// ============================
 async function sendMessage(chatId, text, replyMarkup = null) {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
     const payload = { chat_id: chatId, text, parse_mode: 'Markdown' };
@@ -102,9 +99,6 @@ function splitLongMessage(text, maxLength = 4096) {
     return parts;
 }
 
-// ============================
-// توابع کاربر
-// ============================
 async function getUser(chatId) {
     let user = await db.get('SELECT * FROM users WHERE chatId = ?', chatId);
     if (!user) {
@@ -130,9 +124,6 @@ async function saveUser(chatId, data) {
         JSON.stringify(data.sessions), data.currentSessionIndex, data.waitingFor || null, data.currentAI, chatId);
 }
 
-// ============================
-// توابع هوش مصنوعی (Streaming)
-// ============================
 async function* askGeminiStream(history, photoBase64 = null) {
     const contents = history.map(msg => ({
         role: msg.role === 'user' ? 'user' : 'model',
@@ -168,7 +159,7 @@ async function* askGeminiStream(history, photoBase64 = null) {
     for (const word of words) {
         accumulated += word + ' ';
         yield accumulated.trim();
-        await sleep(80);
+        await sleep(30); // ⬅️ سرعت ۳ برابر بیشتر
     }
 }
 
@@ -239,9 +230,6 @@ async function* askWithFallbackStream(chatId, history, userAI, photoBase64 = nul
     throw new Error(`همه مدل‌ها خطا دادند: ${lastError?.message || 'Unknown'}`);
 }
 
-// ============================
-// منوها
-// ============================
 function mainMenu(currentAI) {
     const aiLabel = currentAI === 'gemini' ? '🤖 Gemini' : '🐋 DeepSeek';
     return {
@@ -283,14 +271,10 @@ function backToMenuButton() {
     };
 }
 
-// ============================
-// Webhook اصلی
-// ============================
 app.post('/webhook', async (req, res) => {
     const body = req.body;
     if (!body) return res.sendStatus(200);
 
-    // --- Callback Query ---
     if (body.callback_query) {
         const query = body.callback_query;
         const chatId = query.message.chat.id;
@@ -402,7 +386,6 @@ app.post('/webhook', async (req, res) => {
         return res.sendStatus(200);
     }
 
-    // --- پیام‌های متنی ---
     if (body.message) {
         const message = body.message;
         const chatId = message.chat.id;
@@ -413,7 +396,6 @@ app.post('/webhook', async (req, res) => {
         let user = await getUser(chatId);
         const userText = text || caption || '';
 
-        // --- Waiting for rename ---
         if (user.waitingFor === 'rename') {
             if (!userText) {
                 await sendMessage(chatId, '❌ **لطفاً یک نام معتبر وارد کنید.**');
@@ -427,7 +409,6 @@ app.post('/webhook', async (req, res) => {
             return res.sendStatus(200);
         }
 
-        // --- Commands ---
         if (userText === '/start') {
             const welcome = 
                 '🌟 **به Gemrox خوش آمدید!** 🌟\n\n' +
@@ -456,7 +437,6 @@ app.post('/webhook', async (req, res) => {
             return res.sendStatus(200);
         }
 
-        // --- پردازش پیام با Stream ---
         await sendChatAction(chatId, 'typing');
 
         try {
@@ -487,10 +467,9 @@ app.post('/webhook', async (req, res) => {
                 photoBase64 = Buffer.from(buffer).toString('base64');
             }
 
-            // ارسال پیام اولیه
-            const initialMsg = await sendMessage(chatId, '⏳ در حال تایپ...');
-            const draftMessageId = initialMsg.result.message_id;
-
+            // شروع Stream بدون پیام اولیه
+            let firstChunk = true;
+            let draftMessageId = null;
             let fullReply = '';
             const streamGenerator = askWithFallbackStream(chatId, history, user.currentAI, photoBase64);
 
@@ -498,12 +477,20 @@ app.post('/webhook', async (req, res) => {
             for await (const chunk of streamGenerator) {
                 fullReply = chunk;
                 chunkCount++;
-                if (chunkCount % 3 === 0) {
+                
+                if (firstChunk) {
+                    // ارسال اولین تکه به عنوان پیام اولیه
+                    const initialMsg = await sendMessage(chatId, chunk + ' ✍️');
+                    draftMessageId = initialMsg.result.message_id;
+                    firstChunk = false;
+                } else if (chunkCount % 2 === 0) {
+                    // هر ۲ تکه یکبار ویرایش کن
                     await editMessage(chatId, draftMessageId, chunk + ' ✍️');
-                    await sleep(300);
+                    await sleep(100);
                 }
             }
 
+            // ویرایش نهایی (بدون ✍️)
             await editMessage(chatId, draftMessageId, fullReply);
 
             const modelMsg = {
@@ -544,9 +531,6 @@ app.post('/webhook', async (req, res) => {
     res.sendStatus(200);
 });
 
-// ============================
-// تنظیم دکمه‌های دائمی
-// ============================
 async function setCommands() {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands`;
     const commands = [
