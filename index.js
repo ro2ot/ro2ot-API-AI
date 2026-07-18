@@ -127,27 +127,25 @@ async function saveUser(chatId, data) {
 }
 
 // ============================
-// تبدیل ویس به متن با Groq (اصلاح شده - با Buffer)
+// تبدیل ویس به متن با Groq (اصلاح نهایی)
 // ============================
 async function transcribeAudio(audioUrl) {
     try {
-        // دانلود فایل صوتی از تلگرام
         const audioResponse = await fetch(audioUrl);
         if (!audioResponse.ok) {
             throw new Error('خطا در دانلود فایل صوتی');
         }
         
-        // تبدیل به Buffer
-        const audioBuffer = await audioResponse.buffer();
+        // استفاده از arrayBuffer و تبدیل به Buffer
+        const arrayBuffer = await audioResponse.arrayBuffer();
+        const audioBuffer = Buffer.from(arrayBuffer);
 
-        // ساخت FormData با Buffer
         const formData = new FormData();
         formData.append('file', audioBuffer, { filename: 'voice.ogg' });
         formData.append('model', 'whisper-large-v3');
         formData.append('language', 'fa');
         formData.append('response_format', 'text');
 
-        // ارسال به Groq
         const response = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
             method: 'POST',
             headers: {
