@@ -1063,6 +1063,8 @@ async function sendStreamingResponse(chatId, streamGenerator, user, userText) {
     let currentMessageLength = 0;
     const MAX_MESSAGE_LENGTH = 3900;
     let hasError = false;
+    let editCounter = 0;
+    const EDIT_INTERVAL = 8; // هر ۸ تکه یکبار ویرایش کن
 
     try {
         for await (const chunk of streamGenerator) {
@@ -1088,24 +1090,33 @@ async function sendStreamingResponse(chatId, streamGenerator, user, userText) {
                 const initialMsg = await sendMessage(chatId, chunk + ' ✍️');
                 draftMessageId = initialMsg.result.message_id;
                 firstChunk = false;
+                editCounter = 0;
             } else if (currentMessageLength > MAX_MESSAGE_LENGTH) {
+                // نهایی کردن پیام فعلی و شروع جدید
                 await sendMessage(chatId, fullReply);
                 draftMessageId = null;
                 firstChunk = true;
                 fullReply = '';
                 currentMessageLength = 0;
+                editCounter = 0;
                 continue;
             } else {
-                try {
-                    await editMessage(chatId, draftMessageId, chunk + ' ✍️');
-                } catch (editError) {
-                    console.warn('⚠️ خطا در ویرایش، ارسال پیام جدید:', editError.message);
-                    await sendMessage(chatId, chunk + ' ✍️');
-                    draftMessageId = null;
-                    firstChunk = true;
-                    fullReply = '';
-                    currentMessageLength = 0;
-                    continue;
+                editCounter++;
+                // فقط هر EDIT_INTERVAL بار ویرایش کن
+                if (editCounter % EDIT_INTERVAL === 0) {
+                    try {
+                        await editMessage(chatId, draftMessageId, chunk + ' ✍️');
+                    } catch (editError) {
+                        console.warn('⚠️ خطا در ویرایش، ارسال پیام جدید:', editError.message);
+                        // اگر ویرایش خطا داد، پیام جدید بفرست و draft را بازنشانی کن
+                        await sendMessage(chatId, chunk + ' ✍️');
+                        draftMessageId = null;
+                        firstChunk = true;
+                        fullReply = '';
+                        currentMessageLength = 0;
+                        editCounter = 0;
+                        continue;
+                    }
                 }
             }
         }
@@ -1113,7 +1124,11 @@ async function sendStreamingResponse(chatId, streamGenerator, user, userText) {
         console.error('❌ خطا در استریم:', error);
         hasError = true;
         if (draftMessageId && fullReply) {
-            await editMessage(chatId, draftMessageId, fullReply + '\n\n⚠️ **پاسخ ناقص دریافت شد.**');
+            try {
+                await editMessage(chatId, draftMessageId, fullReply + '\n\n⚠️ **پاسخ ناقص دریافت شد.**');
+            } catch (e) {
+                await sendMessage(chatId, fullReply + '\n\n⚠️ **پاسخ ناقص دریافت شد.**');
+            }
         } else if (fullReply) {
             await sendMessage(chatId, fullReply + '\n\n⚠️ **پاسخ ناقص دریافت شد.**');
         } else {
@@ -1123,13 +1138,24 @@ async function sendStreamingResponse(chatId, streamGenerator, user, userText) {
         return;
     }
 
+    // نهایی‌سازی با مدیریت خطا
     if (!hasError) {
-        if (draftMessageId) {
-            await editMessage(chatId, draftMessageId, fullReply);
-        } else if (fullReply) {
-            await sendMessage(chatId, fullReply);
-        } else {
-            await sendMessage(chatId, '❌ **پاسخی دریافت نشد. لطفاً دوباره تلاش کنید.**');
+        try {
+            if (draftMessageId) {
+                await editMessage(chatId, draftMessageId, fullReply);
+            } else if (fullReply) {
+                await sendMessage(chatId, fullReply);
+            } else {
+                await sendMessage(chatId, '❌ **پاسخی دریافت نشد. لطفاً دوباره تلاش کنید.**');
+            }
+        } catch (finalError) {
+            console.error('❌ خطا در نهایی‌سازی پیام:', finalError);
+            // اگر ویرایش نهایی خطا داد، پیام جدید ارسال کن
+            if (fullReply) {
+                await sendMessage(chatId, fullReply);
+            } else {
+                await sendMessage(chatId, '❌ **خطا در ارسال پاسخ نهایی. لطفاً دوباره تلاش کنید.**');
+            }
         }
     }
 
@@ -1157,10 +1183,10 @@ setCommands().catch(console.error);
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🤖 Gemrox bot running on port ${PORT}`);
-    console.log(`📡 Models: Gemini + Weak Model (هر دو با Timeout و Retry)`);
+    console.log(`📡 Models: Gemini + Weak Model (با مدیریت نهایی)`);
     console.log(`📎 Link summarizer enabled.`);
     console.log(`📄 File processor enabled (PDF, Word, Excel, TXT).`);
     console.log(`⛔ Cancel/Stop feature enabled.`);
     console.log(`🔄 Auto-retry on 429/503/Timeout errors (3 attempts)`);
-    console.log(`⚡ Fast streaming: chunk size 5 words, 1ms delay for both models`);
+    console.log(`⚡ Streaming with throttled edits (every 8 chunks).`);
 });
