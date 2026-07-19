@@ -424,6 +424,9 @@ async function summarizeLink(url) {
     }
 }
 
+// ============================
+// منوها با دکمه‌ی لغو
+// ============================
 function mainMenu(currentAI) {
     const aiLabel = currentAI === 'gemini' ? '🤖 Gemini' : '⚡ Weak Model';
     return {
@@ -444,6 +447,7 @@ function fileMenu() {
         inline_keyboard: [
             [{ text: '📝 خلاصه‌سازی فایل', callback_data: 'file_summary' }],
             [{ text: '❓ پرسش از فایل', callback_data: 'file_question' }],
+            [{ text: '❌ لغو عملیات', callback_data: 'cancel_operation' }],
             [{ text: '🔙 برگشت به منو', callback_data: 'back_main' }]
         ]
     };
@@ -457,6 +461,7 @@ function sessionMenu() {
             [{ text: '✏️ تغییر نام مکالمه', callback_data: 'rename_session' }],
             [{ text: '🗑️ حذف مکالمه فعلی', callback_data: 'delete_session' }],
             [{ text: '➕ مکالمه جدید', callback_data: 'new_session' }],
+            [{ text: '❌ لغو عملیات', callback_data: 'cancel_operation' }],
             [{ text: '🔙 برگشت به منو', callback_data: 'back_main' }]
         ]
     };
@@ -468,6 +473,7 @@ function memoryMenu() {
             [{ text: '📝 افزودن حافظه جدید', callback_data: 'add_memory' }],
             [{ text: '📋 مشاهده حافظه‌ها', callback_data: 'view_memory' }],
             [{ text: '🗑️ حذف یک حافظه', callback_data: 'delete_memory' }],
+            [{ text: '❌ لغو عملیات', callback_data: 'cancel_operation' }],
             [{ text: '🔙 برگشت به منو', callback_data: 'back_main' }]
         ]
     };
@@ -478,6 +484,7 @@ function aiSelectionMenu() {
         inline_keyboard: [
             [{ text: '🤖 Gemini', callback_data: 'set_ai_gemini' }],
             [{ text: '⚡ Weak Model', callback_data: 'set_ai_gapgpt' }],
+            [{ text: '❌ لغو عملیات', callback_data: 'cancel_operation' }],
             [{ text: '🔙 برگشت به منو', callback_data: 'back_main' }]
         ]
     };
@@ -488,6 +495,7 @@ function sessionsListMenu(sessions, currentIndex) {
         const isActive = index === currentIndex;
         return [{ text: `${isActive ? '✅ ' : ''}${s.name}`, callback_data: `switch_${index}` }];
     });
+    buttons.push([{ text: '❌ لغو عملیات', callback_data: 'cancel_operation' }]);
     buttons.push([{ text: '🔙 برگشت به منو', callback_data: 'back_main' }]);
     return { inline_keyboard: buttons };
 }
@@ -495,6 +503,7 @@ function sessionsListMenu(sessions, currentIndex) {
 function backToMenuButton() {
     return {
         inline_keyboard: [
+            [{ text: '❌ لغو عملیات', callback_data: 'cancel_operation' }],
             [{ text: '🔙 برگشت به منو', callback_data: 'back_main' }]
         ]
     };
@@ -504,7 +513,8 @@ function switchToWeakMenu(pendingMessage) {
     return {
         inline_keyboard: [
             [{ text: '✅ بله، سوئیچ کن', callback_data: 'confirm_switch_to_weak' }],
-            [{ text: '❌ نه، فقط خطا رو نشون بده', callback_data: 'cancel_switch_to_weak' }]
+            [{ text: '❌ نه، فقط خطا رو نشون بده', callback_data: 'cancel_switch_to_weak' }],
+            [{ text: '❌ لغو عملیات', callback_data: 'cancel_operation' }]
         ]
     };
 }
@@ -525,7 +535,19 @@ app.post('/webhook', async (req, res) => {
         try {
             if (data === 'noop') return;
 
+            // ====== لغو عملیات ======
+            if (data === 'cancel_operation') {
+                user.waitingFor = null;
+                user.pendingMessage = null;
+                await saveUser(chatId, user);
+                await editMessage(chatId, messageId, '❌ **عملیات لغو شد.**', mainMenu(user.currentAI));
+                return;
+            }
+
             if (data === 'back_main') {
+                user.waitingFor = null;
+                user.pendingMessage = null;
+                await saveUser(chatId, user);
                 await editMessage(chatId, messageId, '🏠 **منوی اصلی:**', mainMenu(user.currentAI));
                 return;
             }
@@ -759,6 +781,7 @@ app.post('/webhook', async (req, res) => {
             await saveUser(chatId, user);
         }
 
+        // ====== پردازش فایل ======
         if (document) {
             const fileName = document.file_name || 'unknown';
             const mimeType = document.mime_type || '';
@@ -832,6 +855,7 @@ app.post('/webhook', async (req, res) => {
             }
         }
 
+        // ====== پردازش سوال بعد از فایل ======
         if (user.waitingFor === 'file_question_answer' && user.pendingMessage) {
             const extractedText = user.pendingMessage;
             const question = userText;
@@ -871,6 +895,7 @@ app.post('/webhook', async (req, res) => {
             return;
         }
 
+        // ====== حالت‌های انتظار با دکمه‌ی لغو ======
         if (user.waitingFor === 'rename') {
             if (!userText) {
                 await sendMessage(chatId, '❌ **لطفاً یک نام معتبر وارد کنید.**');
@@ -899,7 +924,8 @@ app.post('/webhook', async (req, res) => {
         if (user.waitingFor === 'delete_memory') {
             const index = parseInt(userText) - 1;
             if (isNaN(index) || index < 0 || index >= user.memory.length) {
-                await sendMessage(chatId, '❌ **شماره نامعتبر. لطفاً شماره درست را وارد کنید.**');
+                await sendMessage(chatId, '❌ **شماره نامعتبر. لطفاً شماره درست را وارد کنید.**\n\n' +
+                    'برای لغو عملیات، دکمه‌ی «❌ لغو عملیات» را بزنید.', backToMenuButton());
                 return;
             }
             const deleted = user.memory[index];
@@ -930,6 +956,7 @@ app.post('/webhook', async (req, res) => {
             return;
         }
 
+        // ====== دستورات اصلی ======
         if (userText === '/start') {
             const welcome = '🌟 **به Gemrox خوش آمدید!** 🌟';
             await sendMessage(chatId, welcome, {
@@ -958,6 +985,7 @@ app.post('/webhook', async (req, res) => {
             return;
         }
 
+        // ====== پردازش پیام معمولی ======
         await processNormalMessage(chatId, userText, photo);
         return;
     }
@@ -1064,7 +1092,7 @@ async function sendStreamingResponse(chatId, streamGenerator, user, userText) {
     const MAX_MESSAGE_LENGTH = 3900;
     let hasError = false;
     let editCounter = 0;
-    const EDIT_INTERVAL = 8; // هر ۸ تکه یکبار ویرایش کن
+    const EDIT_INTERVAL = 8;
 
     try {
         for await (const chunk of streamGenerator) {
@@ -1092,7 +1120,6 @@ async function sendStreamingResponse(chatId, streamGenerator, user, userText) {
                 firstChunk = false;
                 editCounter = 0;
             } else if (currentMessageLength > MAX_MESSAGE_LENGTH) {
-                // نهایی کردن پیام فعلی و شروع جدید
                 await sendMessage(chatId, fullReply);
                 draftMessageId = null;
                 firstChunk = true;
@@ -1102,13 +1129,11 @@ async function sendStreamingResponse(chatId, streamGenerator, user, userText) {
                 continue;
             } else {
                 editCounter++;
-                // فقط هر EDIT_INTERVAL بار ویرایش کن
                 if (editCounter % EDIT_INTERVAL === 0) {
                     try {
                         await editMessage(chatId, draftMessageId, chunk + ' ✍️');
                     } catch (editError) {
                         console.warn('⚠️ خطا در ویرایش، ارسال پیام جدید:', editError.message);
-                        // اگر ویرایش خطا داد، پیام جدید بفرست و draft را بازنشانی کن
                         await sendMessage(chatId, chunk + ' ✍️');
                         draftMessageId = null;
                         firstChunk = true;
@@ -1138,7 +1163,6 @@ async function sendStreamingResponse(chatId, streamGenerator, user, userText) {
         return;
     }
 
-    // نهایی‌سازی با مدیریت خطا
     if (!hasError) {
         try {
             if (draftMessageId) {
@@ -1150,7 +1174,6 @@ async function sendStreamingResponse(chatId, streamGenerator, user, userText) {
             }
         } catch (finalError) {
             console.error('❌ خطا در نهایی‌سازی پیام:', finalError);
-            // اگر ویرایش نهایی خطا داد، پیام جدید ارسال کن
             if (fullReply) {
                 await sendMessage(chatId, fullReply);
             } else {
@@ -1183,7 +1206,7 @@ setCommands().catch(console.error);
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`🤖 Gemrox bot running on port ${PORT}`);
-    console.log(`📡 Models: Gemini + Weak Model (با مدیریت نهایی)`);
+    console.log(`📡 Models: Gemini + Weak Model (با مدیریت کامل)`);
     console.log(`📎 Link summarizer enabled.`);
     console.log(`📄 File processor enabled (PDF, Word, Excel, TXT).`);
     console.log(`⛔ Cancel/Stop feature enabled.`);
